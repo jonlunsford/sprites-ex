@@ -224,6 +224,7 @@ defmodule Sprites.Command do
     if state.exit_code == nil do
       send(state.owner, {:error, %{ref: state.ref}, reason})
     end
+
     {:stop, :normal, state}
   end
 
@@ -242,7 +243,11 @@ defmodule Sprites.Command do
   end
 
   @impl true
-  def handle_call({:write_stdin, data}, _from, %{conn: conn, stream_ref: stream_ref, tty_mode: tty_mode} = state)
+  def handle_call(
+        {:write_stdin, data},
+        _from,
+        %{conn: conn, stream_ref: stream_ref, tty_mode: tty_mode} = state
+      )
       when conn != nil do
     frame_data = Protocol.encode_stdin(data, tty_mode)
     :gun.ws_send(conn, stream_ref, {:binary, frame_data})
@@ -263,7 +268,10 @@ defmodule Sprites.Command do
 
   def handle_cast(:close_stdin, state), do: {:noreply, state}
 
-  def handle_cast({:resize, rows, cols}, %{conn: conn, stream_ref: stream_ref, tty_mode: true} = state)
+  def handle_cast(
+        {:resize, rows, cols},
+        %{conn: conn, stream_ref: stream_ref, tty_mode: true} = state
+      )
       when conn != nil do
     message = Jason.encode!(%{type: "resize", rows: rows, cols: cols})
     :gun.ws_send(conn, stream_ref, {:text, message})
@@ -303,6 +311,7 @@ defmodule Sprites.Command do
         if state.conn do
           :gun.ws_send(state.conn, state.stream_ref, :close)
         end
+
         {:stop, :normal, %{state | exit_code: code}}
 
       {:stdin_eof, _} ->
@@ -321,9 +330,11 @@ defmodule Sprites.Command do
 
       {:ok, %{"type" => "exit", "code" => code}} ->
         send(owner, {:exit, %{ref: ref}, code})
+
         if state.conn do
           :gun.ws_send(state.conn, state.stream_ref, :close)
         end
+
         {:stop, :normal, %{state | exit_code: code}}
 
       _ ->
