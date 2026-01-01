@@ -27,8 +27,7 @@ defmodule Sprites.MixProject do
   defp deps do
     [
       {:req, "~> 0.5"},
-      {:mint, "~> 1.5"},
-      {:mint_web_socket, "~> 1.0"},
+      {:gun, "~> 2.1"},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]

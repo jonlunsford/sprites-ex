@@ -2,7 +2,7 @@ defmodule Sprites.Command do
   @moduledoc """
   Represents a running command on a sprite.
 
-  Uses a GenServer to manage the WebSocket connection.
+  Uses a GenServer to manage the WebSocket connection via gun.
   Messages are sent to the owner process:
 
     * `{:stdout, command, data}` - stdout data received
@@ -131,16 +131,16 @@ defmodule Sprites.Command do
       ref: ref,
       tty_mode: tty_mode,
       conn: nil,
-      websocket: nil,
-      request_ref: nil,
+      stream_ref: nil,
       exit_code: nil,
-      buffer: <<>>
+      token: token,
+      url: url
     }
 
-    # Connect synchronously in init to fail fast
+    # Connect asynchronously but wait for connection in init
     case do_connect(url, token) do
-      {:ok, conn, ws_ref} ->
-        {:ok, %{state | conn: conn, request_ref: ws_ref}}
+      {:ok, conn, stream_ref} ->
+        {:ok, %{state | conn: conn, stream_ref: stream_ref}}
 
       {:error, reason} ->
         {:stop, reason}
@@ -149,20 +149,56 @@ defmodule Sprites.Command do
 
   defp do_connect(url, token) do
     uri = URI.parse(url)
-    ws_scheme = if uri.scheme == "wss", do: :wss, else: :ws
-    http_scheme = if uri.scheme == "wss", do: :https, else: :http
-    port = uri.port || if(http_scheme == :https, do: 443, else: 80)
+    host = String.to_charlist(uri.host)
+    port = uri.port || if(uri.scheme == "wss", do: 443, else: 80)
 
-    case Mint.HTTP.connect(http_scheme, uri.host, port, protocols: [:http1]) do
+    transport = if uri.scheme == "wss", do: :tls, else: :tcp
+
+    gun_opts = %{
+      protocols: [:http],
+      transport: transport,
+      tls_opts: [
+        verify: :verify_peer,
+        cacerts: :public_key.cacerts_get(),
+        depth: 3,
+        customize_hostname_check: [
+          match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+        ]
+      ]
+    }
+
+    case :gun.open(host, port, gun_opts) do
       {:ok, conn} ->
-        path = "#{uri.path}?#{uri.query || ""}"
-        headers = [{"authorization", "Bearer #{token}"}]
+        case :gun.await_up(conn, 10_000) do
+          {:ok, _protocol} ->
+            path = "#{uri.path}?#{uri.query || ""}"
+            headers = [{"authorization", "Bearer #{token}"}]
+            stream_ref = :gun.ws_upgrade(conn, path, headers)
 
-        case Mint.WebSocket.upgrade(ws_scheme, conn, path, headers) do
-          {:ok, conn, ref} ->
-            {:ok, conn, ref}
+            # Wait for WebSocket upgrade
+            receive do
+              {:gun_upgrade, ^conn, ^stream_ref, ["websocket"], _headers} ->
+                {:ok, conn, stream_ref}
 
-          {:error, _conn, reason} ->
+              {:gun_response, ^conn, ^stream_ref, _is_fin, status, _headers} ->
+                :gun.close(conn)
+                {:error, {:upgrade_failed, status}}
+
+              {:gun_error, ^conn, ^stream_ref, reason} ->
+                :gun.close(conn)
+                {:error, reason}
+
+              {:gun_error, ^conn, reason} ->
+                :gun.close(conn)
+                {:error, reason}
+            after
+              10_000 ->
+                :gun.close(conn)
+                {:error, :upgrade_timeout}
+            end
+
+          {:error, reason} ->
+            :gun.close(conn)
             {:error, reason}
         end
 
@@ -172,54 +208,45 @@ defmodule Sprites.Command do
   end
 
   @impl true
-  def handle_info(message, %{conn: conn, request_ref: ref, websocket: nil} = state)
-      when conn != nil do
-    case Mint.WebSocket.stream(conn, message) do
-      {:ok, conn, responses} ->
-        state = %{state | conn: conn}
-        handle_upgrade_responses(responses, ref, state)
-
-      {:error, _conn, reason, _responses} ->
-        send(state.owner, {:error, %{ref: state.ref}, reason})
-        {:stop, :normal, state}
-    end
+  def handle_info({:gun_ws, conn, _stream_ref, {:binary, data}}, %{conn: conn} = state) do
+    handle_binary_frame(data, state)
   end
 
-  def handle_info(message, %{conn: conn, websocket: websocket} = state)
-      when conn != nil and websocket != nil do
-    case Mint.WebSocket.stream(conn, message) do
-      {:ok, conn, responses} ->
-        state = %{state | conn: conn}
-        handle_websocket_responses(responses, state)
-
-      {:error, _conn, reason, _responses} ->
-        send(state.owner, {:error, %{ref: state.ref}, reason})
-        {:stop, :normal, state}
-    end
+  def handle_info({:gun_ws, conn, _stream_ref, {:text, json}}, %{conn: conn} = state) do
+    handle_text_frame(json, state)
   end
 
-  def handle_info({:tcp_closed, _}, state), do: handle_connection_closed(state)
-  def handle_info({:ssl_closed, _}, state), do: handle_connection_closed(state)
-  def handle_info(_message, state), do: {:noreply, state}
+  def handle_info({:gun_ws, conn, _stream_ref, {:close, code, reason}}, %{conn: conn} = state) do
+    handle_close_frame(code, reason, state)
+  end
+
+  def handle_info({:gun_down, conn, _protocol, reason, _killed_streams}, %{conn: conn} = state) do
+    if state.exit_code == nil do
+      send(state.owner, {:error, %{ref: state.ref}, reason})
+    end
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:gun_error, conn, _stream_ref, reason}, %{conn: conn} = state) do
+    send(state.owner, {:error, %{ref: state.ref}, reason})
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:gun_error, conn, reason}, %{conn: conn} = state) do
+    send(state.owner, {:error, %{ref: state.ref}, reason})
+    {:stop, :normal, state}
+  end
+
+  def handle_info(_message, state) do
+    {:noreply, state}
+  end
 
   @impl true
-  def handle_call({:write_stdin, data}, _from, %{conn: conn, websocket: websocket, tty_mode: tty_mode} = state)
-      when websocket != nil do
+  def handle_call({:write_stdin, data}, _from, %{conn: conn, stream_ref: stream_ref, tty_mode: tty_mode} = state)
+      when conn != nil do
     frame_data = Protocol.encode_stdin(data, tty_mode)
-
-    case Mint.WebSocket.encode(websocket, {:binary, frame_data}) do
-      {:ok, websocket, data_to_send} ->
-        case Mint.HTTP.stream_request_body(conn, state.request_ref, data_to_send) do
-          {:ok, conn} ->
-            {:reply, :ok, %{state | conn: conn, websocket: websocket}}
-
-          {:error, conn, reason} ->
-            {:reply, {:error, reason}, %{state | conn: conn}}
-        end
-
-      {:error, websocket, reason} ->
-        {:reply, {:error, reason}, %{state | websocket: websocket}}
-    end
+    :gun.ws_send(conn, stream_ref, {:binary, frame_data})
+    {:reply, :ok, state}
   end
 
   def handle_call({:write_stdin, _data}, _from, state) do
@@ -227,51 +254,27 @@ defmodule Sprites.Command do
   end
 
   @impl true
-  def handle_cast(:close_stdin, %{conn: conn, websocket: websocket, tty_mode: false} = state)
-      when websocket != nil do
+  def handle_cast(:close_stdin, %{conn: conn, stream_ref: stream_ref, tty_mode: false} = state)
+      when conn != nil do
     frame_data = Protocol.encode_stdin_eof()
-
-    case Mint.WebSocket.encode(websocket, {:binary, frame_data}) do
-      {:ok, websocket, data_to_send} ->
-        case Mint.HTTP.stream_request_body(conn, state.request_ref, data_to_send) do
-          {:ok, conn} ->
-            {:noreply, %{state | conn: conn, websocket: websocket}}
-
-          {:error, conn, _reason} ->
-            {:noreply, %{state | conn: conn}}
-        end
-
-      {:error, websocket, _reason} ->
-        {:noreply, %{state | websocket: websocket}}
-    end
+    :gun.ws_send(conn, stream_ref, {:binary, frame_data})
+    {:noreply, state}
   end
 
   def handle_cast(:close_stdin, state), do: {:noreply, state}
 
-  def handle_cast({:resize, rows, cols}, %{conn: conn, websocket: websocket, tty_mode: true} = state)
-      when websocket != nil do
+  def handle_cast({:resize, rows, cols}, %{conn: conn, stream_ref: stream_ref, tty_mode: true} = state)
+      when conn != nil do
     message = Jason.encode!(%{type: "resize", rows: rows, cols: cols})
-
-    case Mint.WebSocket.encode(websocket, {:text, message}) do
-      {:ok, websocket, data_to_send} ->
-        case Mint.HTTP.stream_request_body(conn, state.request_ref, data_to_send) do
-          {:ok, conn} ->
-            {:noreply, %{state | conn: conn, websocket: websocket}}
-
-          {:error, conn, _reason} ->
-            {:noreply, %{state | conn: conn}}
-        end
-
-      {:error, websocket, _reason} ->
-        {:noreply, %{state | websocket: websocket}}
-    end
+    :gun.ws_send(conn, stream_ref, {:text, message})
+    {:noreply, state}
   end
 
   def handle_cast({:resize, _, _}, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, %{conn: conn}) when conn != nil do
-    Mint.HTTP.close(conn)
+    :gun.close(conn)
     :ok
   end
 
@@ -279,102 +282,12 @@ defmodule Sprites.Command do
 
   # Private helpers
 
-  defp handle_upgrade_responses(responses, request_ref, state) do
-    case find_upgrade_response(responses, request_ref) do
-      {:ok, status, headers} when status == 101 ->
-        case Mint.WebSocket.new(state.conn, request_ref, status, headers) do
-          {:ok, conn, websocket} ->
-            {:noreply, %{state | conn: conn, websocket: websocket}}
-
-          {:error, _conn, reason} ->
-            send(state.owner, {:error, %{ref: state.ref}, reason})
-            {:stop, :normal, state}
-        end
-
-      {:ok, status, _headers} ->
-        send(state.owner, {:error, %{ref: state.ref}, {:upgrade_failed, status}})
-        {:stop, :normal, state}
-
-      :waiting ->
-        {:noreply, state}
-
-      {:error, reason} ->
-        send(state.owner, {:error, %{ref: state.ref}, reason})
-        {:stop, :normal, state}
-    end
-  end
-
-  defp find_upgrade_response(responses, request_ref) do
-    status = Enum.find_value(responses, fn
-      {:status, ^request_ref, status} -> status
-      _ -> nil
-    end)
-
-    headers = Enum.flat_map(responses, fn
-      {:headers, ^request_ref, headers} -> headers
-      _ -> []
-    end)
-
-    done? = Enum.any?(responses, fn
-      {:done, ^request_ref} -> true
-      _ -> false
-    end)
-
-    error = Enum.find_value(responses, fn
-      {:error, ^request_ref, reason} -> reason
-      _ -> nil
-    end)
-
-    cond do
-      error != nil -> {:error, error}
-      status != nil and done? -> {:ok, status, headers}
-      status != nil -> {:ok, status, headers}
-      true -> :waiting
-    end
-  end
-
-  defp handle_websocket_responses(responses, state) do
-    Enum.reduce(responses, {:noreply, state}, fn response, {_, acc_state} ->
-      case response do
-        {:data, _ref, data} ->
-          handle_websocket_data(data, acc_state)
-
-        {:done, _ref} ->
-          handle_connection_closed(acc_state)
-
-        _ ->
-          {:noreply, acc_state}
-      end
-    end)
-  end
-
-  defp handle_websocket_data(data, %{websocket: websocket, buffer: buffer} = state) do
-    full_data = buffer <> data
-
-    case Mint.WebSocket.decode(websocket, full_data) do
-      {:ok, websocket, frames} ->
-        state = %{state | websocket: websocket, buffer: <<>>}
-        process_frames(frames, state)
-
-      {:error, websocket, reason} ->
-        send(state.owner, {:error, %{ref: state.ref}, reason})
-        {:stop, :normal, %{state | websocket: websocket}}
-    end
-  end
-
-  defp process_frames(frames, state) do
-    # Process all frames - collect final result
-    Enum.reduce(frames, {:noreply, state}, fn frame, {_action, acc_state} ->
-      handle_frame(frame, acc_state)
-    end)
-  end
-
-  defp handle_frame({:binary, data}, %{tty_mode: true, owner: owner, ref: ref} = state) do
+  defp handle_binary_frame(data, %{tty_mode: true, owner: owner, ref: ref} = state) do
     send(owner, {:stdout, %{ref: ref}, data})
     {:noreply, state}
   end
 
-  defp handle_frame({:binary, data}, %{tty_mode: false, owner: owner, ref: ref} = state) do
+  defp handle_binary_frame(data, %{tty_mode: false, owner: owner, ref: ref} = state) do
     case Protocol.decode(data) do
       {:stdout, payload} ->
         send(owner, {:stdout, %{ref: ref}, payload})
@@ -386,6 +299,10 @@ defmodule Sprites.Command do
 
       {:exit, code} ->
         send(owner, {:exit, %{ref: ref}, code})
+        # Send close frame and stop
+        if state.conn do
+          :gun.ws_send(state.conn, state.stream_ref, :close)
+        end
         {:stop, :normal, %{state | exit_code: code}}
 
       {:stdin_eof, _} ->
@@ -396,7 +313,7 @@ defmodule Sprites.Command do
     end
   end
 
-  defp handle_frame({:text, json}, %{owner: owner, ref: ref} = state) do
+  defp handle_text_frame(json, %{owner: owner, ref: ref} = state) do
     case Jason.decode(json) do
       {:ok, %{"type" => "port", "port" => port}} ->
         send(owner, {:port, %{ref: ref}, port})
@@ -404,6 +321,9 @@ defmodule Sprites.Command do
 
       {:ok, %{"type" => "exit", "code" => code}} ->
         send(owner, {:exit, %{ref: ref}, code})
+        if state.conn do
+          :gun.ws_send(state.conn, state.stream_ref, :close)
+        end
         {:stop, :normal, %{state | exit_code: code}}
 
       _ ->
@@ -411,25 +331,12 @@ defmodule Sprites.Command do
     end
   end
 
-  defp handle_frame({:close, _code, _reason}, %{exit_code: nil, owner: owner, ref: ref} = state) do
+  defp handle_close_frame(_code, _reason, %{exit_code: nil, owner: owner, ref: ref} = state) do
     send(owner, {:exit, %{ref: ref}, 0})
     {:stop, :normal, state}
   end
 
-  defp handle_frame({:close, _code, _reason}, state) do
-    {:stop, :normal, state}
-  end
-
-  defp handle_frame(_frame, state) do
-    {:noreply, state}
-  end
-
-  defp handle_connection_closed(%{exit_code: nil, owner: owner, ref: ref} = state) do
-    send(owner, {:error, %{ref: ref}, :connection_closed})
-    {:stop, :normal, state}
-  end
-
-  defp handle_connection_closed(state) do
+  defp handle_close_frame(_code, _reason, state) do
     {:stop, :normal, state}
   end
 
