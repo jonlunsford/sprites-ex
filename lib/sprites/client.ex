@@ -101,7 +101,11 @@ defmodule Sprites.Client do
     params = if prefix = Keyword.get(opts, :prefix), do: [prefix: prefix], else: []
 
     case Req.get(client.req, url: "/v1/sprites", params: params) do
+      {:ok, %{status: status, body: %{"sprites" => sprites}}} when status in 200..299 ->
+        {:ok, sprites}
+
       {:ok, %{status: status, body: body}} when status in 200..299 ->
+        # Fallback for unexpected response format
         {:ok, body}
 
       {:ok, %{status: status, body: body}} ->
