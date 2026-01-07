@@ -27,6 +27,10 @@ sprites-*.tar
 /test_cli/deps/
 /test_cli/test-cli
 
+# Examples build artifacts
+/examples/_build/
+/examples/deps/
+
 # IDE and editor files
 .idea/
 .vscode/
